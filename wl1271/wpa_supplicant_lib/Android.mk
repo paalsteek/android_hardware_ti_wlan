@@ -89,10 +89,21 @@ ifdef CONFIG_WPS
 L_CFLAGS += -DCONFIG_WPS
 endif
 
+# used to fix wifi signal refresh on rssi-approx
+ifeq ($(WPA_SUPPL_APPROX_USE_RSSI),true)
+L_CFLAGS += -DAPPROX_USE_RSSI_COMMAND
+endif
+
+# backport from WPA supplicant 8
+ifeq ($(WPA_SUPPL_WITH_SIGNAL_POLL),true)
+L_CFLAGS += -DWPA_SUPPL_WITH_SIGNAL_POLL
+endif
+
 ########################
  
 include $(CLEAR_VARS)
 LOCAL_MODULE := libCustomWifi
+LOCAL_MODULE_TAGS := optional
 LOCAL_SHARED_LIBRARIES := libc libcutils
 LOCAL_CFLAGS := $(L_CFLAGS)
 LOCAL_SRC_FILES := $(OBJS)

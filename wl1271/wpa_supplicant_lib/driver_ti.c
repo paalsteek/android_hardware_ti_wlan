@@ -142,6 +142,18 @@ static int wpa_driver_tista_private_send( void *priv, u32 ioctl_cmd, void *bufIn
 	res = ioctl(drv->ioctl_sock, SIOCIWFIRSTPRIV, &iwr);
 	if (0 != res)
 	{
+		if (errno == 95) { // ignoring TIWLN_REMOVE_RX_DATA_FILTER give more a RX_DATA_COUNTERS_PARAM error
+			switch (ioctl_cmd) {
+			case TIWLN_REMOVE_RX_DATA_FILTER: //0x8000306
+				wpa_printf(MSG_WARNING, "Warning, wifi remove rx data filter command not implemented (ioctl_cmd = %x)", ioctl_cmd);
+				drv->errors=0;
+				return -1;
+			case 0x8021501: // RX_DATA_COUNTERS_PARAM CTRL_DATA_MODULE_PARAM
+				wpa_printf(MSG_WARNING, "Warning, wifi RX_DATA_COUNTERS_PARAM command not implemented (ioctl_cmd = %x)", ioctl_cmd);
+				drv->errors=0;
+				return -1;
+			}
+		}
 		wpa_printf(MSG_ERROR, "ERROR - wpa_driver_tista_private_send - error sending Wext private IOCTL to STA driver (ioctl_cmd = %x,  res = %d, errno = %d)", ioctl_cmd, res, errno);
 		drv->errors++;
 		if (drv->errors > MAX_NUMBER_SEQUENTIAL_ERRORS) {
@@ -211,7 +223,7 @@ int wpa_driver_tista_parse_custom(void *ctx, const void *custom)
 			/* Dm: wpa_printf(MSG_INFO,"wpa_supplicant - Link Speed = %u", pStaDrv->link_speed ); */
 			break;
 		default:
-			wpa_printf(MSG_DEBUG, "Unknown event");
+			wpa_printf(MSG_DEBUG, "Unknown event 0x%x", pData->EvParams.uEventType);
 			break;
 	}
 
@@ -586,7 +598,21 @@ static int get_num_of_channels(char *country)
 {
 	int channels = NUMBER_SCAN_CHANNELS_FCC;
 
-	if (os_strcasecmp(country, "EU"))
+	if (os_strcasecmp(country, "CN"))
+		channels = NUMBER_SCAN_CHANNELS_MKK1;
+	else if (os_strcasecmp(country, "EU"))
+		channels = NUMBER_SCAN_CHANNELS_ETSI;
+	else if (os_strcasecmp(country, "FR"))
+		channels = NUMBER_SCAN_CHANNELS_ETSI;
+	else if (os_strcasecmp(country, "DE"))
+		channels = NUMBER_SCAN_CHANNELS_ETSI;
+	else if (os_strcasecmp(country, "ES"))
+		channels = NUMBER_SCAN_CHANNELS_ETSI;
+	else if (os_strcasecmp(country, "IT"))
+		channels = NUMBER_SCAN_CHANNELS_ETSI;
+	else if (os_strcasecmp(country, "NL"))
+		channels = NUMBER_SCAN_CHANNELS_ETSI;
+	else if (os_strcasecmp(country, "BE"))
 		channels = NUMBER_SCAN_CHANNELS_ETSI;
 	else if (os_strcasecmp(country, "JP"))
 		channels = NUMBER_SCAN_CHANNELS_MKK1;
@@ -628,6 +654,8 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 		    (flags & IFF_UP)) {
 			wpa_printf(MSG_ERROR, "TI: %s when iface is UP", cmd);
 			wpa_driver_wext_set_ifflags(drv->wext, flags & ~IFF_UP);
+			// for ics this state is required, but not sure it's correctly reported
+			wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "INTERFACE_DISABLED");
 		}
 		ret = wpa_driver_tista_driver_stop(priv);
 		if( ret == 0 ) {
@@ -653,9 +681,15 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 		ret = 0;
 	}
 	else if( os_strcasecmp(cmd, "scan-active") == 0 ) {
-		wpa_printf(MSG_DEBUG,"Scan Active command");
-		drv->scan_type =  SCAN_TYPE_NORMAL_ACTIVE;
-		ret = 0;
+		if (!drv->suspendopt) {
+			wpa_printf(MSG_DEBUG,"Scan Active command");
+			drv->scan_type =  SCAN_TYPE_NORMAL_ACTIVE;
+			ret = 0;
+		} else {
+			wpa_printf(MSG_DEBUG,"Scan Active command ignored, suspendopt=1");
+			drv->scan_type =  SCAN_TYPE_NORMAL_PASSIVE;
+			ret = 0;
+		}
 	}
 	else if( os_strcasecmp(cmd, "scan-mode") == 0 ) {
 		wpa_printf(MSG_DEBUG,"Scan Mode command");
@@ -674,8 +708,8 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 	}
 	else if( os_strncasecmp(cmd, "country", 7) == 0 ) {
 		drv->scan_channels = get_num_of_channels(cmd + 8);
-		ret = sprintf(buf,"Scan-Channels = %d\n", drv->scan_channels);
-		wpa_printf(MSG_DEBUG, "buf %s", buf);
+		wpa_printf(MSG_DEBUG, "Country '%s' -> %d channels", cmd, drv->scan_channels);
+		ret = 0;
 	}
 	else if( os_strncasecmp(cmd, "scan-channels", 13) == 0 ) {
 		int noOfChan;
@@ -687,6 +721,7 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 		ret = sprintf(buf,"Scan-Channels = %d\n", drv->scan_channels);
 		wpa_printf(MSG_DEBUG, "buf %s", buf);
 	}
+#ifndef APPROX_USE_RSSI_COMMAND
 	else if( os_strcasecmp(cmd, "rssi-approx") == 0 ) {
 		scan_result_t *cur_res;
 		struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)(drv->ctx);
@@ -706,16 +741,24 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 				os_memcpy((void *)buf, (void *)(p_ssid->ssid), len);
 				ret = len;
 				ret += snprintf(&buf[ret], buf_len-len, " rssi %d\n", rssi);
+				// keep as cache
+				os_memcpy(&drv->last_scan_res, cur_res, sizeof(scan_result_t));
+				if (cur_res->noise == 0) {
+					//noise is not implemented, use diff btw beacon & data
+					drv->last_scan_res.noise = rssi_beacon - rssi_data;
+				}
 			}
+			wpa_printf(MSG_DEBUG,"level=%d, cached=%d", cur_res->level, drv->last_scan_res.level);
 		}
 	}
-	else if( os_strcasecmp(cmd, "rssi") == 0 ) {
+#endif
+	else if( os_strncasecmp(cmd, "rssi", 4) == 0 ) {
 		u8 ssid[MAX_SSID_LEN];
 		scan_result_t *cur_res;
 		struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)(drv->ctx);
 		int rssi_data, rssi_beacon, len;
 
-		wpa_printf(MSG_DEBUG,"rssi command");
+		wpa_printf(MSG_DEBUG,"%s command", cmd);
 
 		ret = wpa_driver_tista_get_rssi(priv, &rssi_data, &rssi_beacon);
 		if( ret == 0 ) {
@@ -730,8 +773,16 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 				if( !wpa_s )
 					return( ret );
 				cur_res = scan_get_by_bssid(drv, wpa_s->bssid);
-				if( cur_res )
+				if( cur_res ) {
 					cur_res->level = rssi_beacon;
+					// keep as cache
+					os_memcpy(&drv->last_scan_res, cur_res, sizeof(scan_result_t));
+					if (cur_res->noise == 0) {
+						drv->last_scan_res.noise = rssi_beacon - rssi_data;
+					}
+				} else {
+					drv->last_scan_res.noise = rssi_beacon - rssi_data;
+				}
 			}
 			else
 			{
@@ -843,6 +894,11 @@ static int wpa_driver_tista_driver_cmd( void *priv, char *cmd, char *buf, size_t
 				}
 			}
 		}
+	}
+	else if( os_strncasecmp(cmd, "setsuspendopt ", 14) == 0 ) {
+		/* stub to remove errors in ICS */
+		drv->suspendopt = atoi(cmd + 14);
+		ret = 0;
 	}
 	else {
 		wpa_printf(MSG_DEBUG,"Unsupported command");
@@ -1243,7 +1299,7 @@ static struct wpa_scan_results *wpa_driver_tista_get_scan_results(void *priv)
 {
 	struct wpa_driver_ti_data *drv = priv;
 	struct wpa_scan_results *res;
-	struct wpa_scan_res **tmp;
+	scan_result_t **tmp;
 	unsigned ap_num;
 
 	TI_CHECK_DRIVER( drv->driver_is_loaded, NULL );
@@ -1254,12 +1310,12 @@ static struct wpa_scan_results *wpa_driver_tista_get_scan_results(void *priv)
 
 	wpa_printf(MSG_DEBUG, "Actual APs number %d", res->num);
 	ap_num = (unsigned)scan_count(drv) + res->num;
-	tmp = os_realloc(res->res, ap_num * sizeof(struct wpa_scan_res *));
+	tmp = os_realloc(res->res, ap_num * sizeof(scan_result_t *));
 	if (tmp == NULL)
 		return res;
 	res->num = scan_merge(drv, tmp, drv->force_merge_flag, res->num, ap_num);
 	wpa_printf(MSG_DEBUG, "After merge, APs number %d", res->num);
-	tmp = os_realloc(tmp, res->num * sizeof(struct wpa_scan_res *));
+	tmp = os_realloc(tmp, res->num * sizeof(scan_result_t *));
 	res->res = tmp;
 	return res;
 }
@@ -1280,14 +1336,14 @@ Compare function for sorting scan results. Return >0 if @b is considered better.
 -----------------------------------------------------------------------------*/
 static int wpa_driver_tista_scan_result_compare(const void *a, const void *b)
 {
-	const struct wpa_scan_result *wa = a;
-	const struct wpa_scan_result *wb = b;
+	const scan_result_t *wa = a;
+	const scan_result_t *wb = b;
 
 	return( wb->level - wa->level );
 }
 
 static int wpa_driver_tista_get_scan_results(void *priv,
-					      struct wpa_scan_result *results,
+					      scan_result_t* results,
 					      size_t max_size)
 {
 	struct wpa_driver_ti_data *drv = priv;
@@ -1303,7 +1359,7 @@ static int wpa_driver_tista_get_scan_results(void *priv,
 	/* Merge new results with previous */
         ap_num = scan_merge(drv, results, drv->force_merge_flag, ap_num, max_size);
 	wpa_printf(MSG_DEBUG, "After merge, APs number %d", ap_num);
-	qsort(results, ap_num, sizeof(struct wpa_scan_result),
+	qsort(results, ap_num, sizeof(scan_result_t),
 		wpa_driver_tista_scan_result_compare);
 	return ap_num;
 }
@@ -1412,6 +1468,50 @@ static int wpa_driver_tista_set_operstate(void *priv, int state)
 	return wpa_driver_wext_set_operstate(drv->wext, state);
 }
 
+// backport from wpa supplicant 8
+#ifdef WPA_SUPPL_WITH_SIGNAL_POLL
+#define RSSI_CMD      "RSSI"
+#define LINKSPEED_CMD "LINKSPEED"
+int wpa_driver_tista_signal_poll(void *priv, struct wpa_signal_info *si)
+{
+	char buf[MAX_DRV_CMD_SIZE];
+	struct wpa_driver_ti_data *drv = priv;
+	struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)(drv->ctx);
+	scan_result_t *cur_res;
+	char *prssi;
+	int res;
+
+	os_memset(si, 0, sizeof(*si));
+	res = wpa_driver_tista_driver_cmd(priv, RSSI_CMD, buf, sizeof(buf));
+	/* Answer: SSID rssi -Val */
+	if (res < 0)
+		return res;
+	prssi = strcasestr(buf, RSSI_CMD);
+	if (!prssi)
+		return -1;
+
+	si->current_signal = atoi(prssi + strlen(RSSI_CMD) + 1);
+
+	if (wpa_s) {
+		si->current_txrate = wpa_s->link_speed / 1000;
+		cur_res = scan_get_by_bssid(drv, wpa_s->bssid);
+		if( cur_res && cur_res->freq ) {
+			si->frequency      = cur_res->freq;
+			si->current_signal = cur_res->level;
+		} else {
+			si->frequency      = drv->last_scan_res.freq;
+		}
+		si->current_noise = drv->last_scan_res.noise;
+		if (si->current_noise < 0) {
+			si->current_noise = 0 - si->current_noise;
+		}
+	}
+
+	return 0;
+}
+#endif
+
+
 const struct wpa_driver_ops wpa_driver_custom_ops = {
 	.name = TIWLAN_DRV_NAME,
 	.desc = "TI Station Driver (1271)",
@@ -1443,5 +1543,8 @@ const struct wpa_driver_ops wpa_driver_custom_ops = {
 	.set_mode = wpa_driver_tista_set_mode,
 	.set_probe_req_ie = wpa_driver_tista_set_probe_req_ie,
 #endif
-	.driver_cmd = wpa_driver_tista_driver_cmd
+	.driver_cmd = wpa_driver_tista_driver_cmd,
+#ifdef WPA_SUPPL_WITH_SIGNAL_POLL
+	.signal_poll = wpa_driver_tista_signal_poll,
+#endif
 };
